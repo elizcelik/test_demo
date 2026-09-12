@@ -4,6 +4,10 @@ var RAW_SHEET_NAME = "Raw Submissions";
 
 /* =========================================================
    PUBLIC WAITLIST SUBMISSION
+
+   Writes straight to both Raw Submissions (the backup log)
+   and Waitlist in the same request. No trigger, no separate
+   sync step — the signup lands in Waitlist immediately.
    ========================================================= */
 
 function doPost(e) {
@@ -32,12 +36,59 @@ function doPost(e) {
       data.ts ||
       receivedAt;
 
+    var waitlistStatus = "SAVED";
+    var waitlistError = "";
+
 
     /* ---------------------------------------------------------
-       STEP 1
-       CAPTURE THE FULL SIGNUP IN RAW SUBMISSIONS FIRST
+       WRITE TO WAITLIST FIRST
 
-       This is our source of truth / recovery backup.
+       If this fails for any reason, we still want the signup
+       captured in Raw Submissions below rather than losing it.
+       --------------------------------------------------------- */
+
+    try {
+
+      var waitlist =
+        ss.getSheetByName(SHEET_NAME);
+
+      if (!waitlist) {
+        throw new Error("Waitlist sheet not found");
+      }
+
+      waitlist.appendRow([
+        timestamp,
+        data.first || "",
+        data.last || "",
+        data.email || "",
+        data.phone || "",
+        data.device || "",
+        data.concern || "",
+        data.source || "",
+        data.agreePrerelease ? "Yes" : "No",
+        data.agreeConsent ? "Yes" : "No"
+      ]);
+
+    } catch (waitlistErr) {
+
+      waitlistStatus = "WAITLIST WRITE FAILED";
+
+      waitlistError =
+        waitlistErr && waitlistErr.message
+          ? waitlistErr.message
+          : String(waitlistErr);
+
+      Logger.log(
+        "WAITLIST WRITE FAILED: " + waitlistError
+      );
+    }
+
+
+    /* ---------------------------------------------------------
+       CAPTURE THE FULL SIGNUP IN RAW SUBMISSIONS
+
+       This is our source of truth / recovery backup, and
+       records whether the Waitlist write above succeeded.
        --------------------------------------------------------- */
 
     var rawSheet =
@@ -57,28 +108,12 @@ function doPost(e) {
       data.source || "",   // J - how they heard
       data.agreePrerelease ? "Yes" : "No", // K - pre-release ack
       data.agreeConsent ? "Yes" : "No",    // L - 18+ consent
-      "CAPTURED",          // M - waitlist status
+      waitlistStatus,      // M - waitlist status
       "SKIPPED",           // N - substack status
-      ""                   // O - error
+      waitlistError        // O - error
     ]);
 
-    // Force Google Sheets to commit the backup before
-    // telling the website that signup succeeded.
     SpreadsheetApp.flush();
-
-
-    /* ---------------------------------------------------------
-       STEP 2
-       SYNC INTO WAITLIST RIGHT NOW
-
-       The person is already safely captured in Raw Submissions
-       above, so this can't lose their signup even if it fails.
-       Calling it here (instead of only waiting on a scheduled
-       trigger) means Waitlist updates the moment someone signs
-       up, not on the next scheduled run.
-       --------------------------------------------------------- */
-
-    syncCapturedToWaitlist();
 
     return jsonResponse({
       success: true,
@@ -102,263 +137,6 @@ function doPost(e) {
           ? err.message
           : "Unable to capture signup"
     });
-  }
-}
-
-
-
-/* =========================================================
-   BACKGROUND SYNC
-   RAW SUBMISSIONS → WAITLIST
-
-   Set this function to run automatically every minute.
-   ========================================================= */
-
-function syncCapturedToWaitlist() {
-
-  // Prevent two trigger runs from syncing at the same time.
-  var lock =
-    LockService.getScriptLock();
-
-  try {
-
-    lock.tryLock(25000);
-
-    if (!lock.hasLock()) {
-      return;
-    }
-
-    var ss =
-      SpreadsheetApp.getActiveSpreadsheet();
-
-    var raw =
-      ss.getSheetByName(RAW_SHEET_NAME);
-
-    var waitlist =
-      ss.getSheetByName(SHEET_NAME);
-
-    if (!raw || !waitlist) {
-      return;
-    }
-
-
-    var rawValues =
-      raw.getDataRange().getValues();
-
-    if (rawValues.length <= 1) {
-      return;
-    }
-
-
-    /* ---------------------------------------------------------
-       BUILD A LIST OF PEOPLE ALREADY IN WAITLIST
-
-       This prevents duplicate rows if a previous sync
-       succeeded but failed before changing Raw status to SAVED.
-       --------------------------------------------------------- */
-
-    var existing = {};
-
-    var waitlistLastRow =
-      waitlist.getLastRow();
-
-    if (waitlistLastRow > 1) {
-
-      var waitlistValues =
-        waitlist
-          .getRange(
-            2,
-            1,
-            waitlistLastRow - 1,
-            Math.max(waitlist.getLastColumn(), 10)
-          )
-          .getValues();
-
-      for (
-        var w = 0;
-        w < waitlistValues.length;
-        w++
-      ) {
-
-        var existingTimestamp =
-          String(
-            waitlistValues[w][0] || ""
-          ).trim();
-
-        var existingEmail =
-          String(
-            waitlistValues[w][3] || ""
-          )
-            .trim()
-            .toLowerCase();
-
-        if (
-          existingTimestamp ||
-          existingEmail
-        ) {
-
-          existing[
-            existingTimestamp +
-            "|" +
-            existingEmail
-          ] = true;
-        }
-      }
-    }
-
-
-    /* ---------------------------------------------------------
-       PROCESS CAPTURED / RETRY ROWS
-       --------------------------------------------------------- */
-
-    for (
-      var i = 1;
-      i < rawValues.length;
-      i++
-    ) {
-
-      var row =
-        rawValues[i];
-
-      var status =
-        String(row[12] || "").trim();
-
-      if (
-        status !== "CAPTURED" &&
-        status !== "NEEDS RETRY"
-      ) {
-        continue;
-      }
-
-
-      var timestamp =
-        row[2];
-
-      var first =
-        row[3];
-
-      var last =
-        row[4];
-
-      var email =
-        row[5];
-
-      var phone =
-        row[6];
-
-      var device =
-        row[7];
-
-      var concern =
-        row[8];
-
-      var source =
-        row[9];
-
-      var agreePrerelease =
-        row[10];
-
-      var agreeConsent =
-        row[11];
-
-
-      var duplicateKey =
-        String(timestamp || "").trim() +
-        "|" +
-        String(email || "")
-          .trim()
-          .toLowerCase();
-
-
-      try {
-
-        /* ---------------------------------------------
-           If this exact signup already exists,
-           don't add it twice.
-           --------------------------------------------- */
-
-        if (existing[duplicateKey]) {
-
-          raw
-            .getRange(i + 1, 13)
-            .setValue("SAVED");
-
-          raw
-            .getRange(i + 1, 15)
-            .setValue("");
-
-          continue;
-        }
-
-
-        /* ---------------------------------------------
-           WRITE TO NORMAL WAITLIST
-           --------------------------------------------- */
-
-        waitlist.appendRow([
-          timestamp,
-          first,
-          last,
-          email,
-          phone,
-          device,
-          concern,
-          source,
-          agreePrerelease,
-          agreeConsent
-        ]);
-
-
-        existing[duplicateKey] =
-          true;
-
-
-        /* ---------------------------------------------
-           MARK RAW BACKUP AS SUCCESSFULLY SYNCED
-           --------------------------------------------- */
-
-        raw
-          .getRange(i + 1, 13)
-          .setValue("SAVED");
-
-        raw
-          .getRange(i + 1, 15)
-          .setValue("");
-
-
-      } catch (err) {
-
-        /* ---------------------------------------------
-           NEVER DELETE THE RAW SIGNUP.
-
-           Mark it for another retry instead.
-           --------------------------------------------- */
-
-        raw
-          .getRange(i + 1, 13)
-          .setValue("NEEDS RETRY");
-
-        raw
-          .getRange(i + 1, 15)
-          .setValue(
-            err && err.message
-              ? err.message
-              : String(err)
-          );
-      }
-    }
-
-
-    SpreadsheetApp.flush();
-
-
-  } finally {
-
-    try {
-      lock.releaseLock();
-    } catch (e) {
-      // Nothing to do.
-    }
   }
 }
 

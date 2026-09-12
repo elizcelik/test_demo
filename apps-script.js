@@ -68,14 +68,17 @@ function doPost(e) {
 
 
     /* ---------------------------------------------------------
-       IMPORTANT
+       STEP 2
+       SYNC INTO WAITLIST RIGHT NOW
 
-       Once Raw Submissions contains the signup,
-       the person is safely captured.
-
-       Do NOT wait for Waitlist sync.
-       Do NOT wait for Substack.
+       The person is already safely captured in Raw Submissions
+       above, so this can't lose their signup even if it fails.
+       Calling it here (instead of only waiting on a scheduled
+       trigger) means Waitlist updates the moment someone signs
+       up, not on the next scheduled run.
        --------------------------------------------------------- */
+
+    syncCapturedToWaitlist();
 
     return jsonResponse({
       success: true,
